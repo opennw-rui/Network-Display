@@ -1,0 +1,143 @@
+#!/bin/bash
+ip xfrm policy | awk '
+BEGIN {
+    Y = "\033[33m"    # 黄色 - Src
+    P = "\033[35m"    # 紫粉色 - Dst
+    R = "\033[31m"    # 红色   - Dir / Proto
+    B = "\033[34m"    # 蓝色   - 表头
+    Z = "\033[0m"     # 重置色
+
+    # 列宽设置
+    w_src = 18; w_dst = 18; w_dir = 5; w_pri = 9
+    w_pt = 7; w_pro = 7; w_mod = 8; w_spi = 10; w_req = 5
+
+    # 表头
+    printf B
+    printf "%-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s\n", \
+      w_src, "Src", w_dst, "Dst", w_dir, "Dir", w_pri, "Priority", \
+      w_pt, "Ptype", w_pro, "Proto", w_mod, "Mode", w_spi, "SPI", w_req, "Reqid"
+    printf Z
+    print "--------------------------------------------------------------------------------------------------"
+}
+
+# 跳过纯分隔线
+/^[[:space:]]*-+[[:space:]]*$/ { next }
+
+# 读取src行
+/^src / {
+    src=$2; dst=$4
+    dir=""; priority=""; ptype=""
+    proto="-"; mode="-"; spi="-"; reqid="-"
+    next
+}
+
+# 读取dir行
+/^[[:space:]]+dir/ {
+    dir=$2; priority=$4; ptype=$6
+    next
+}
+
+# 读取tmpl行
+/^[[:space:]]+tmpl/ {
+    getline
+    for(i=1;i<=NF;i++){
+        if($i=="proto") proto=$(i+1)
+        if($i=="spi")   spi=$(i+1)
+        if($i=="mode")  mode=$(i+1)
+        if($i=="reqid") reqid=$(i+1)
+    }
+
+    # 输出每个字段，"-"不加颜色
+    len=length(src); pad=(w_src-len); if(pad<0)pad=0
+    printf "%s%s%s", (src=="-"?"":Y), src, (src=="-"?"":Z)
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(dst); pad=(w_dst-len); if(pad<0)pad=0
+    printf "%s%s%s", (dst=="-"?"":P), dst, (dst=="-"?"":Z)
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(dir); pad=(w_dir-len); if(pad<0)pad=0
+    printf "%s%s%s", (dir=="-"?"":B), dir, (dir=="-"?"":Z)
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(priority); pad=(w_pri-len); if(pad<0)pad=0
+    printf "%s", priority
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(ptype); pad=(w_pt-len); if(pad<0)pad=0
+    printf "%s", ptype
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(proto); pad=(w_pro-len); if(pad<0)pad=0
+    printf "%s%s%s", (proto=="-"?"":R), proto, (proto=="-"?"":Z)
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(mode); pad=(w_mod-len); if(pad<0)pad=0
+    printf "%s", mode
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(spi); pad=(w_spi-len); if(pad<0)pad=0
+    printf "%s", spi
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(reqid); pad=(w_req-len); if(pad<0)pad=0
+    printf "%s", reqid
+    for(i=0;i<pad;i++) printf " "
+    printf "\n"
+    next
+}
+
+# 读取socket行
+/^[[:space:]]+socket/ {
+    s_src=src; s_dst=dst
+    sdir=$2; spri=$5; spt=$7
+
+    len=length(s_src); pad=(w_src-len); if(pad<0)pad=0
+    printf "%s%s%s", (s_src=="-"?"":Y), s_src, (s_src=="-"?"":Z)
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(s_dst); pad=(w_dst-len); if(pad<0)pad=0
+    printf "%s%s%s", (s_dst=="-"?"":P), s_dst, (s_dst=="-"?"":Z)
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(sdir); pad=(w_dir-len); if(pad<0)pad=0
+    printf "%s%s%s", (sdir=="-"?"":B), sdir, (sdir=="-"?"":Z)
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(spri); pad=(w_pri-len); if(pad<0)pad=0
+    printf "%s", spri
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    len=length(spt); pad=(w_pt-len); if(pad<0)pad=0
+    printf "%s", spt
+    for(i=0;i<pad;i++) printf " "
+    printf " "
+
+    # Proto、Mode、SPI、Reqid 全为 -
+    printf "%s", "-"
+    for(i=0;i<w_pro-1;i++) printf " "
+    printf " "
+    printf "%s", "-"
+    for(i=0;i<w_mod-1;i++) printf " "
+    printf " "
+    printf "%s", "-"
+    for(i=0;i<w_spi-1;i++) printf " "
+    printf " "
+    printf "%s", "-"
+    for(i=0;i<w_req-1;i++) printf " "
+    printf "\n"
+    next
+}
+'
