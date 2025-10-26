@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+#
+# Streamed routel - colorized, paginated, ultra-low-CPU display
+# Supports -i PATTERN, -p N (space to page), -t TABLE
+
+import sys, getopt, subprocess, re, signal, select, termios, tty
+
+# === ANSI colors ===
+C_RESET = "\033[0m"
+C_BLUE = "\033[34m"
+C_YELLOW = "\033[33m"
+C_MAGENTA = "\033[35m"
+C_WHITE = "\033[37m"
+C_RED = "\033[31m"
+
+KEYS = ['Dst', 'Gateway', 'Prefsrc', 'Protocol', 'Scope', 'Metric', 'Dev', 'Table']
+COLOR_MAP = {'Dst': C_YELLOW, 'Gateway': C_MAGENTA, 'Dev': C_BLUE, 'Protocol': C_RED}
+
+# === signal ===
+def sigint_handler(signum, frame):
+    sys.stdout.write("\nTerminated by user.\n")
+    sys.exit(0)
+signal.signal(signal.SIGINT, sigint_handler)
+
+# === wait for space key ===
+def wait_space():
+    sys.stdout.write("......Press <space> for next page, Ctrl+C to quit......")
+    sys.stdout.flush()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        r, _, _ = select.select([fd], [], [], None)
+        if r:
+            ch = sys.stdin.read(1)
+            sys.stdout.write("\r" + " " * 60 + "\r")
+            sys.stdout.flush()
+            return ch == ' '
+        return False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+# === parse lines to rows, optional regex filtering ===
+def parse_lines_to_rows(lines, colw, table, pat_search=None):
+    rows = []
+    default_protocol = 'kernel'
+    default_scope = 'global'
+    default_metric = '0'
+    default_table = table if table != 'all' else 'main'
+    special_scopes = {'local': 'host', 'anycast': 'host', 'multicast': 'link', 'broadcast': 'global'}
+
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        row = [''] * 8
+        i = 0
+        if parts[0] in special_scopes:
+            row[0] = parts[1] if len(parts) > 1 else '/'
+            row[3] = 'kernel'
+            row[4] = special_scopes[parts[0]]
+            i = 2
+        else:
+            row[0] = parts[0]
+            row[3] = default_protocol
+            row[4] = default_scope
+            i = 1
+        row[1] = '/'
+        row[2] = '/'
+        row[5] = default_metric
+        row[6] = '/'
+        row[7] = default_table
+        plen = len(parts)
+        while i < plen:
+            if i + 1 >= plen:
+                break
+            key = parts[i]
+            nxt = parts[i + 1]
+            if key == 'via':
+                row[1] = nxt
+            elif key == 'dev':
+                row[6] = nxt
+            elif key == 'proto':
+                row[3] = nxt
+            elif key == 'scope':
+                row[4] = nxt
+            elif key == 'metric':
+                row[5] = nxt
+            elif key == 'src':
+                row[2] = nxt
+            elif key == 'table':
+                row[7] = nxt
+            i += 2
+        if pat_search and not pat_search(' '.join(row)):
+            continue
+        rows.append(row)
+        for j in range(8):
+            if len(row[j]) > colw[j]:
+                colw[j] = len(row[j])
+    return rows
+
+# === format rows to printable lines (with ANSI) ===
+def format_rows_to_lines(rows, colw, color_seq):
+    out_lines = []
+    for row in rows:
+        segs = []
+        for j, val in enumerate(row):
+            c = color_seq[j]
+            if val != '/':
+                segs.append(f"{c}{val.ljust(colw[j])}{C_RESET}")
+            else:
+                segs.append(val.ljust(colw[j]))
+        out_lines.append("  ".join(segs) + "\n")
+    return out_lines
+
+# === compute header and dashline ===
+def make_header_and_dash(colw):
+    visible_len = sum(colw) + 2 * (len(colw) - 1)
+    header_plain = "  ".join(KEYS[i].ljust(colw[i]) for i in range(len(colw)))
+    header_colored = f"{C_BLUE}{header_plain}{C_RESET}"
+    dashline = '-' * visible_len
+    return header_colored, dashline
+
+# === Main ===
+def main():
+    family, page_size, include_pat, table = "inet", 200, None, "all"
+
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "h46f:i:p:t:", ["help", "family="])
+    except getopt.GetoptError as e:
+        print(e); sys.exit(1)
+
+    for opt, arg in opts:
+        if opt in ("-h", "--help"):
+            print(f"Usage: {sys.argv[0]} [-4|-6] [-p N] [-i PATTERN] [-t TABLE]")
+            return
+        elif opt == "-6": family = "inet6"
+        elif opt == "-4": family = "inet"
+        elif opt in ("-f", "--family"): family = arg
+        elif opt == "-p":
+            try: page_size = int(arg)
+            except: page_size = 200
+        elif opt == "-i":
+            include_pat = re.compile(arg, re.IGNORECASE)
+        elif opt == "-t":
+            table = arg
+
+    cmd = ['ip', '-f', family, 'route', 'list', 'table', table]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, bufsize=1, universal_newlines=True)
+
+    colw = [len(k) for k in KEYS]
+    printed_header = False
+    raw_buffer = []
+    color_seq = [COLOR_MAP.get(k, C_WHITE) for k in KEYS]
+
+    fast_match = include_pat.pattern.lower() if include_pat else None
+    pat_search = include_pat.search if include_pat else None
+
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+        if not line: continue
+        # cheap prefilter for -i
+        if fast_match and fast_match not in line.lower():
+            continue
+        raw_buffer.append(line)
+        if len(raw_buffer) >= page_size:
+            rows = parse_lines_to_rows(raw_buffer, colw, table, pat_search)
+            if rows:
+                if not printed_header:
+                    header_colored, dashline = make_header_and_dash(colw)
+                    sys.stdout.write(header_colored + "\n" + dashline + "\n")
+                    printed_header = True
+                out_lines = format_rows_to_lines(rows, colw, color_seq)
+                sys.stdout.writelines(out_lines)
+                sys.stdout.flush()
+                raw_buffer.clear()
+                if not wait_space(): break
+
+    # final flush
+    if raw_buffer:
+        rows = parse_lines_to_rows(raw_buffer, colw, table, pat_search)
+        if rows:
+            if not printed_header:
+                header_colored, dashline = make_header_and_dash(colw)
+                sys.stdout.write(header_colored + "\n" + dashline + "\n")
+            out_lines = format_rows_to_lines(rows, colw, color_seq)
+            sys.stdout.writelines(out_lines)
+            sys.stdout.flush()
+
+    proc.stdout.close()
+    proc.wait()
+
+if __name__ == "__main__":
+    main()
