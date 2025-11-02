@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+
+import re, sys, getopt, datetime, os
+from collections import deque
+
+RE_CONNECT = re.compile(
+    r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*\[(?P<user>[^\]]+)\]\s+Peer Connection Initiated with \[AF_INET\](?P<ip>[0-9.]+):\d+'
+)
+RE_DISCONNECT = re.compile(
+    r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?(?P<user>[A-Za-z0-9_.-]+)/(?P<ip>[0-9.]+):\d+.*?(?:Connection reset, restarting|client-instance exiting)'
+)
+RE_DISCONNECT_ALT = re.compile(
+    r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?(?:Connection reset, restarting|client-instance exiting)'
+)
+RE_LEARN = re.compile(r'MULTI:\s+Learn:\s+([0-9.]+)\s+->\s+(?P<user>[A-Za-z0-9_.-]+)/(?P<ip>[0-9.]+):\d+')
+
+RESULTS_MAXLEN = 200000
+
+
+def tail_read_lines(filename, max_lines=100000):
+    avg_line_size = 150
+    chunk_size = avg_line_size * max_lines * 2
+    file_size = os.path.getsize(filename)
+    start = max(0, file_size - chunk_size)
+
+    with open(filename, "rb") as f:
+        f.seek(start)
+        data = f.read().decode(errors="ignore")
+    lines = data.splitlines()
+    return lines[-max_lines:]
+
+
+def parse_status(status_file):
+    online_set = set()
+    try:
+        with open(status_file, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception:
+        return online_set
+
+    start = False
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Common Name,Real Address"):
+            start = True
+            continue
+        if start:
+            if line == "ROUTING TABLE" or line == "END":
+                break
+            if not line:
+                continue
+            parts = line.split(',')
+            if len(parts) >= 2:
+                user = parts[0]
+                real_ip = parts[1].split(':')[0]
+                online_set.add((user, real_ip))
+    return online_set
+
+
+def parse_log(logfile, client_filters=None, p_limit=50):
+    sessions = {}
+    results = deque(maxlen=RESULTS_MAXLEN)
+    last_vpnip = None
+
+    def client_matches(user):
+        if not client_filters:
+            return True
+        return any(filt in user.lower() for filt in client_filters)
+
+    lines = tail_read_lines(logfile, max_lines=100000)
+
+    for line in lines:
+        if 'MULTI: Learn:' in line:
+            m = RE_LEARN.search(line)
+            if m:
+                vpnip = m.group(1)
+                user_learn = m.group('user')
+                ip_learn = m.group('ip')
+                key_learn = (user_learn, ip_learn)
+                if key_learn in sessions:
+                    sessions[key_learn]['vpnip'] = vpnip
+                last_vpnip = vpnip
+            continue
+
+        if 'Peer Connection Initiated' in line:
+            m = RE_CONNECT.search(line)
+            if m:
+                ts = m.group(1)
+                user = m.group('user')
+                ip = m.group('ip')
+                if not client_matches(user):
+                    continue
+                vpnip = last_vpnip if last_vpnip else '-'
+                sessions[(user, ip)] = {'user': user, 'public_ip': ip, 'up': ts, 'vpnip': vpnip}
+            continue
+
+        if 'Connection reset, restarting' in line or 'client-instance exiting' in line:
+            m = RE_DISCONNECT.search(line)
+            if m:
+                ts = m.group(1)
+                user = m.group('user')
+                ip = m.group('ip')
+                key = (user, ip)
+                if key not in sessions:
+                    continue
+                info = sessions[key]
+                up_ts = info['up']
+                vpnip = info.get('vpnip', '-') or '-'
+                try:
+                    dt1 = datetime.datetime.strptime(up_ts, '%Y-%m-%d %H:%M:%S')
+                    dt2 = datetime.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                    duration = dt2 - dt1
+                    duration_str = str(duration)
+                except Exception:
+                    duration_str = '-'
+                up_date, up_time = up_ts.split(' ')
+                down_date, down_time = ts.split(' ')
+                results.append({
+                    'user': user,
+                    'public_ip': ip,
+                    'vpn_ip': vpnip,
+                    'up_date': up_date,
+                    'up_time': up_time,
+                    'down_date': down_date,
+                    'down_time': down_time,
+                    'duration': duration_str
+                })
+                del sessions[key]
+                continue
+
+            m = RE_DISCONNECT_ALT.search(line)
+            if m:
+                ts = m.group(1)
+                found_key = None
+                for key, info in sessions.items():
+                    if info['user'] in line and info['public_ip'] in line:
+                        found_key = key
+                        break
+                if found_key:
+                    info = sessions[found_key]
+                    user = info['user']
+                    ip = info['public_ip']
+                    up_ts = info['up']
+                    vpnip = info.get('vpnip', '-') or '-'
+                    try:
+                        dt1 = datetime.datetime.strptime(up_ts, '%Y-%m-%d %H:%M:%S')
+                        dt2 = datetime.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                        duration = dt2 - dt1
+                        duration_str = str(duration)
+                    except Exception:
+                        duration_str = '-'
+                    up_date, up_time = up_ts.split(' ')
+                    down_date, down_time = ts.split(' ')
+                    results.append({
+                        'user': user,
+                        'public_ip': ip,
+                        'vpn_ip': vpnip,
+                        'up_date': up_date,
+                        'up_time': up_time,
+                        'down_date': down_date,
+                        'down_time': down_time,
+                        'duration': duration_str
+                    })
+                    del sessions[found_key]
+                continue
+
+    for key, info in sessions.items():
+        up_date, up_time = info['up'].split(' ')
+        results.append({
+            'user': info['user'],
+            'public_ip': info['public_ip'],
+            'vpn_ip': info.get('vpnip', '-') or '-',
+            'up_date': up_date,
+            'up_time': up_time,
+            'down_date': '-',
+            'down_time': '-',
+            'duration': 'ONLINE'
+        })
+
+    results = sorted(results, key=lambda r: r['up_date'] + ' ' + r['up_time'], reverse=True)
+
+    if p_limit != 'all' and len(results) > p_limit:
+        results = results[:p_limit]
+
+    return results
+
+
+def verify_online_status(records, online_set):
+    for r in records:
+        if r['duration'] == 'ONLINE':
+            key = (r['user'], r['public_ip'])
+            if key not in online_set:
+                r['duration'] = 'UNKNOWN'
+
+
+def print_table(records, p_limit):
+    headers = ['User', 'Public IP', 'VPN IP', 'Up Date', 'Up Time', 'Down Date', 'Down Time', 'Duration']
+    cols = ['user', 'public_ip', 'vpn_ip', 'up_date', 'up_time', 'down_date', 'down_time', 'duration']
+
+    rows = records
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, c in enumerate(cols):
+            widths[i] = max(widths[i], len(str(r[c])))
+
+    total_width = sum(widths) + len(widths) * 3 + 1
+    total_count = len(rows)
+    online_count = sum(1 for r in rows if r['duration'] == 'ONLINE')
+
+    print('-' * total_width)
+    print(f"|{'Total: %d          Online: %d' % (total_count, online_count):^{total_width-2}}|")
+    print('-' * total_width)
+    print("| " + " | ".join(f"{headers[i]:<{widths[i]}}" for i in range(len(headers))) + " |")
+    print('-' * total_width)
+    for r in rows:
+        print("| " + " | ".join(f"{str(r[c]):<{widths[i]}}" for i, c in enumerate(cols)) + " |")
+    print('-' * total_width)
+
+
+def main(argv):
+    logfile = None
+    p_limit = 50
+    client_filter = None
+    status_file = None
+
+    try:
+        opts, args = getopt.getopt(argv, "c:p:i:s:", ["log=", "show=", "client=", "status="])
+    except getopt.GetoptError:
+        print("Usage: openvpn_log_parser_fast.py -c <logfile> -s <statusfile> [-p <num|all>] [-i <clientname[,client2]>]")
+        sys.exit(2)
+
+    for opt, arg in opts:
+        if opt == '-c':
+            logfile = arg
+        elif opt == '-p':
+            v = arg.lower()
+            if v == 'all':
+                p_limit = 'all'
+            else:
+                try:
+                    p_limit = int(v)
+                except ValueError:
+                    print("Error: -p must be integer or 'all'")
+                    sys.exit(2)
+        elif opt == '-i':
+            names = [s.strip().lower() for s in arg.split(',') if s.strip()]
+            client_filter = set(names) if names else None
+        elif opt == '-s':
+            status_file = arg
+
+    if not logfile or not status_file:
+        print("Error: must specify both log file with -c and status file with -s")
+        print("Usage: openvpn_log_parser_fast.py -c <logfile> -s <statusfile> [-p <num|all>] [-i <clientname[,client2]>]")
+        sys.exit(1)
+
+    records = parse_log(logfile, client_filters=client_filter, p_limit=p_limit)
+    if status_file:
+        online_set = parse_status(status_file)
+        verify_online_status(records, online_set)
+    if not records:
+        print("No matching records found.")
+        sys.exit(0)
+    print_table(records, p_limit)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
